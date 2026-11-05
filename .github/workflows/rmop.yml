@@ -1,0 +1,141 @@
+# .github/workflows/rmop.yml
+# Builds the RMOP dashboard from the 62-member HGEFS (31 GEFS + 31 AIGEFS) for every cycle
+# (00/06/12/18Z), keeps the last 7 days of PNG images, and publishes everything to GitHub Pages.
+name: RMOP HGEFS
+
+on:
+  schedule:
+    # ~5 h after each cycle starts (NCEP publishes a cycle roughly 3-6 h after its nominal time).
+    # The "wait" step below polls until the last file exists, so a late cycle is fine.
+    - cron: "17 5,11,17,23 * * *"
+  workflow_dispatch:
+    inputs:
+      init:
+        description: "Init time YYYYMMDDHH (HH = 00/06/12/18). Blank = newest cycle that is at least 5 h old."
+        required: false
+      history_days:
+        description: "Days of history used for ranking (5-30). Use ~10 for a quick first run, then 30."
+        required: false
+        default: "30"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: rmop-hgefs
+  cancel-in-progress: false
+
+env:
+  LAST_LEAD: "240"          # forecast hours are 12, 24 ... LAST_LEAD
+  KEEP_DAYS: "7"
+  HISTORY_DAYS: ${{ inputs.history_days || '30' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install numpy pillow matplotlib requests eccodes cartopy
+
+      # 30-day history used to rank each forecast (one entry per cycle/day/hour).
+      - name: Restore history cache
+        uses: actions/cache/restore@v4
+        with:
+          path: rmop_cache
+          key: hgefs-cache-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: hgefs-cache-
+
+      # The previous site (images + manifest) is how the 7-day archive survives between runs.
+      - name: Restore archive
+        uses: actions/cache/restore@v4
+        with:
+          path: site
+          key: hgefs-site-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: hgefs-site-
+
+      - name: Pick the cycle and wait until GEFS and AIGEFS are complete
+        id: cycle
+        timeout-minutes: 130
+        env:
+          INIT_IN: ${{ inputs.init }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INIT_IN:-}" ]; then
+            [[ "$INIT_IN" =~ ^[0-9]{8}(00|06|12|18)$ ]] || { echo "::error::init must be YYYYMMDDHH with HH = 00, 06, 12 or 18"; exit 1; }
+            INIT="$INIT_IN"
+          else
+            T=$(( $(date -u +%s) - 5*3600 ))      # newest cycle that started at least 5 h ago
+            T=$(( T - T % 21600 ))
+            INIT=$(date -u -d "@$T" +%Y%m%d%H)
+          fi
+          echo "init=$INIT" >> "$GITHUB_OUTPUT"
+          echo "Cycle: $INIT"
+          D=${INIT:0:8}; H=${INIT:8:2}; F=$(printf '%03d' "$LAST_LEAD")
+          gefs="https://noaa-gefs-pds.s3.amazonaws.com/gefs.$D/$H/atmos/pgrb2ap5"
+          aws="https://noaa-nws-graphcastgfs-pds.s3.amazonaws.com/EAGLE_ensemble/aigefs.$D/$H"
+          nom="https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigefs/prod/aigefs.$D/$H"
+          up() { [ "$(curl -s -o /dev/null -w '%{http_code}' -I "$1" || true)" = 200 ]; }
+          ai_up() {   # AIGEFS member $1: on AWS or on NOMADS
+            t="mem$1/model/atmos/grib2/aigefs.t${H}z.pres.f$F.grib2.idx"
+            up "$aws/$t" || up "$nom/$t"
+          }
+          ok=0
+          for try in $(seq 1 24); do
+            ok=1
+            for m in gec00 gep30; do up "$gefs/$m.t${H}z.pgrb2a.0p50.f$F.idx" || ok=0; done
+            for m in 000 030; do ai_up "$m" || ok=0; done
+            [ "$ok" = 1 ] && break
+            echo "GEFS/AIGEFS $INIT not complete yet (check $try/24), waiting 5 min"
+            sleep 300
+          done
+          [ "$ok" = 1 ] || { echo "::error::GEFS/AIGEFS $INIT still incomplete after 2 h"; exit 1; }
+
+      - name: Build RMOP site
+        timeout-minutes: 320     # step-level limit so the cache-save steps below still run
+        env:
+          INIT: ${{ steps.cycle.outputs.init }}
+        run: |
+          python rmop.py run --source hgefs --init "$INIT" --lead-range 12 "$LAST_LEAD" 12 \
+            --climo climo_z500.npz --site site --cache rmop_cache --keep-days "$KEEP_DAYS" \
+            --history-days "$HISTORY_DAYS" --workers 10
+
+      - name: Prune history cache older than 35 days
+        if: always()
+        run: find rmop_cache -name '*.npz' -mtime +35 -delete 2>/dev/null || true
+
+      - name: Save history cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: rmop_cache
+          key: hgefs-cache-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save archive
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: site
+          key: hgefs-site-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
